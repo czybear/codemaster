@@ -19,11 +19,11 @@ import oss2
 
 endpoint = get_config("ALIBABA_CLOUD_OSS_ENDPOINT")
 
-ALI_API_ID = get_config("ALIBABA_CLOUD_OSS_ACCESS_KEY_ID")
-ALI_API_SECRET = get_config("ALIBABA_CLOUD_OSS_ACCESS_KEY_SECRET")
-IMAGE_BASE_URL = get_config("ALIBABA_CLOUD_OSS_BASE_URL")
-BUCKET_NAME = get_config("ALIBABA_CLOUD_OSS_BUCKET")
-if not ALI_API_ID or not ALI_API_SECRET:
+ALI_API_ID = get_config("ALIBABA_CLOUD_OSS_ACCESS_KEY_ID", None)
+ALI_API_SECRET = get_config("ALIBABA_CLOUD_OSS_ACCESS_KEY_SECRET", None)
+IMAGE_BASE_URL = get_config("ALIBABA_CLOUD_OSS_BASE_URL", None)
+BUCKET_NAME = get_config("ALIBABA_CLOUD_OSS_BUCKET", None)
+if not ALI_API_ID or not ALI_API_SECRET or ALI_API_ID == "" or ALI_API_SECRET == "":
     current_app.logger.warning(
         "ALIBABA_CLOUD_ACCESS_KEY_ID or ALIBABA_CLOUD_ACCESS_KEY_SECRET not configured"
     )
@@ -143,6 +143,7 @@ def generate_temp_user(
 
 
 def update_user_open_id(app: Flask, user_id: str, wx_code: str) -> str:
+    app.logger.info(f"update_user_open_id user_id: {user_id} wx_code: {wx_code}")
     with app.app_context():
         user = User.query.filter(User.user_id == user_id).first()
         if user:
@@ -152,6 +153,9 @@ def update_user_open_id(app: Flask, user_id: str, wx_code: str) -> str:
                 if wx_openid and user.user_open_id != wx_openid and wx_openid != "":
                     user.user_open_id = wx_openid
                     db.session.commit()
+                    app.logger.info(
+                        f"update_user_open_id user_id: {user_id} wx_openid: {wx_openid}"
+                    )
                 return wx_openid
         else:
             app.logger.error("user not found")
@@ -172,8 +176,10 @@ def get_content_type(filename):
 def upload_user_avatar(app: Flask, user_id: str, avatar) -> str:
     with app.app_context():
         if (
-            not current_app.config["ALIBABA_CLOUD_OSS_ACCESS_KEY_ID"]
-            or not current_app.config["ALIBABA_CLOUD_OSS_ACCESS_KEY_SECRET"]
+            not ALI_API_ID
+            or not ALI_API_SECRET
+            or ALI_API_ID == ""
+            or ALI_API_SECRET == ""
         ):
             raise_error_with_args(
                 "API.ALIBABA_CLOUD_NOT_CONFIGURED",

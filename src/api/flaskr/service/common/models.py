@@ -56,6 +56,7 @@ ERROR_CODE = {
     "DISCOUNT.ORDER_DISCOUNT_ALREADY_USED": 3106,
     "DISCOUNT.DISCOUNT_LIMIT_EXCEEDED": 3107,
     "DISCOUNT.DISCOUNT_ALREADY_EXPIRED": 3108,
+    "DISCOUNT.DISCOUNT_COUNT_NOT_ZERO": 3109,
     # course error
     "COURSE.COURSE_NOT_FOUND": 4001,
     "COURSE.LESSON_CANNOT_BE_RESET": 4002,
@@ -69,6 +70,7 @@ ERROR_CODE = {
     "FILE.FILE_SIZE_EXCEED": 6003,
     # params error
     "COMMON.PARAMS_ERROR": 2001,
+    "COMMON.TEXT_NOT_ALLOWED": 2002,
     # Admin errors
     "ADMIN.VIEW_NOT_FOUND": 7001,
     # LLM errors
@@ -78,6 +80,10 @@ ERROR_CODE = {
     # api errors
     "API.ALIBABA_CLOUD_NOT_CONFIGURED": 9001,
 }
+
+
+def register_error(error_name, error_code):
+    ERROR_CODE[error_name] = error_code
 
 
 def raise_param_error(param_message):

@@ -8,6 +8,8 @@ from langchain.prompts import PromptTemplate
 from ...service.lesson.const import (
     ASK_MODE_DEFAULT,
     LESSON_TYPE_BRANCH_HIDDEN,
+    LESSON_TYPE_TRIAL,
+    LESSON_TYPE_NORMAL,
     SCRIPT_TYPE_SYSTEM,
 )
 from ...service.lesson.models import AICourse, AILesson, AILessonScript
@@ -28,6 +30,10 @@ from ...service.profile.funcs import get_user_profiles
 from ...service.study.dtos import AILessonAttendDTO, ScriptDTO
 from ...service.study.models import AICourseAttendAsssotion, AICourseLessonAttendScript
 from ...dao import db
+from ...service.order.funs import query_raw_buy_record
+from ...service.order.consts import BUY_STATUS_SUCCESS
+from flaskr.service.user.models import User
+from flaskr.framework import extensible
 
 
 def get_current_lesson(
@@ -37,7 +43,10 @@ def get_current_lesson(
 
 
 def generation_attend(
-    app: Flask, attend: AICourseLessonAttendDTO, script_info: AILessonScript
+    app: Flask,
+    attend: AICourseLessonAttendDTO,
+    script_info: AILessonScript,
+    with_ui_conf: bool = False,
 ) -> AICourseLessonAttendScript:
     attendScript = AICourseLessonAttendScript()
     attendScript.attend_id = attend.attend_id
@@ -45,11 +54,14 @@ def generation_attend(
     attendScript.lesson_id = script_info.lesson_id
     attendScript.course_id = attend.course_id
     attendScript.script_id = script_info.script_id
+    attendScript.script_ui_type = script_info.script_ui_type
     attendScript.log_id = generate_id(app)
+    if with_ui_conf:
+        attendScript.script_ui_conf = script_info.script_other_conf
     return attendScript
 
 
-def check_phone_number(app, user_id, input):
+def check_phone_number(app, user_info: User, input):
     if not re.match(r"^1[3-9]\d{9}$", input):
         return False
     return True
@@ -105,6 +117,7 @@ def get_lesson_and_attend_info(app: Flask, parent_no, course_id, user_id):
         AILesson.status == 1,
     ).all()
     if len(lessons) == 0:
+
         return []
     app.logger.info(
         "lessons:{}".format(
@@ -116,6 +129,40 @@ def get_lesson_and_attend_info(app: Flask, parent_no, course_id, user_id):
         AICourseLessonAttend.user_id == user_id,
         AICourseLessonAttend.status != ATTEND_STATUS_RESET,
     ).all()
+
+    if len(attend_infos) != len(lessons):
+        lessons = [lesson for lesson in lessons if lesson.status == 1]
+        lesson_type = lessons[0].lesson_type
+        add_attend = False
+        if lesson_type == LESSON_TYPE_TRIAL:
+            add_attend = True
+        elif lesson_type == LESSON_TYPE_NORMAL:
+            raw_order = query_raw_buy_record(app, user_id, course_id)
+            if raw_order and raw_order.status == BUY_STATUS_SUCCESS:
+                add_attend = True
+            else:
+                raise_error("COURSE.COURSE_NOT_PURCHASED")
+        if add_attend:
+            app.logger.info("add attend to fix attend info")
+            for lesson in lessons:
+                attends = [
+                    attend
+                    for attend in attend_infos
+                    if attend.lesson_id == lesson.lesson_id
+                ]
+                if len(attends) == 0:
+                    app.logger.info("add attend to lesson:{}".format(lesson.lesson_id))
+                    attend = AICourseLessonAttend()
+                    attend.attend_id = generate_id(app)
+                    attend.lesson_id = lesson.lesson_id
+                    attend.course_id = course_id
+                    attend.user_id = user_id
+                    attend.status = ATTEND_STATUS_LOCKED
+                    attend.lesson_no = lesson.lesson_no
+                    db.session.add(attend)
+                    attend_infos.append(attend)
+            db.session.flush()
+
     attend_lesson_infos = [
         {
             "attend": attend,
@@ -125,6 +172,7 @@ def get_lesson_and_attend_info(app: Flask, parent_no, course_id, user_id):
         }
         for attend in attend_infos
     ]
+    app.logger.info("attend_lesson_infos length:{}".format(len(attend_lesson_infos)))
     attend_lesson_infos = sorted(
         attend_lesson_infos,
         key=lambda x: (len(x["lesson"].lesson_no), x["lesson"].lesson_no),
@@ -226,7 +274,6 @@ def get_script(app: Flask, attend_id: str, next: int = 0):
     if attend_info.status == ATTEND_STATUS_NOT_STARTED or attend_info.script_index <= 0:
         attend_info.status = ATTEND_STATUS_IN_PROGRESS
         attend_info.script_index = 1
-
         # 检查是否是第一节课
         lesson = AILesson.query.filter(
             AILesson.lesson_id == attend_info.lesson_id
@@ -238,6 +285,7 @@ def get_script(app: Flask, attend_id: str, next: int = 0):
                 lesson.lesson_id,
                 attend_status_values[ATTEND_STATUS_IN_PROGRESS],
                 ATTEND_STATUS_IN_PROGRESS,
+                lesson.lesson_type,
             )
         )
         app.logger.info(lesson.lesson_no)
@@ -267,6 +315,7 @@ def get_script(app: Flask, attend_id: str, next: int = 0):
                         parent_lesson.lesson_id,
                         attend_status_values[ATTEND_STATUS_IN_PROGRESS],
                         ATTEND_STATUS_IN_PROGRESS,
+                        parent_lesson.lesson_type,
                     )
                 )
 
@@ -324,6 +373,7 @@ def get_script(app: Flask, attend_id: str, next: int = 0):
                     lesson.lesson_id,
                     attend_status_values[ATTEND_STATUS_COMPLETED],
                     ATTEND_STATUS_COMPLETED,
+                    lesson.lesson_type,
                 )
             )
     db.session.flush()
@@ -342,7 +392,14 @@ def make_script_dto(script_type, script_content, script_id) -> str:
     )
 
 
-def update_attend_lesson_info(app: Flask, attend_id: str) -> list[AILessonAttendDTO]:
+def make_script_dto_to_stream(dto: ScriptDTO) -> str:
+    return (
+        "data: " + json.dumps(dto, default=fmt) + "\n\n".encode("utf-8").decode("utf-8")
+    )
+
+
+@extensible
+def update_lesson_status(app: Flask, attend_id: str):
     attend_status_values = get_attend_status_values()
     res = []
     attend_info = AICourseLessonAttend.query.filter(
@@ -359,6 +416,7 @@ def update_attend_lesson_info(app: Flask, attend_id: str) -> list[AILessonAttend
             lesson.lesson_id,
             attend_status_values[ATTEND_STATUS_COMPLETED],
             ATTEND_STATUS_COMPLETED,
+            lesson.lesson_type,
         )
     )
     if len(parent_no) > 2:
@@ -380,6 +438,7 @@ def update_attend_lesson_info(app: Flask, attend_id: str) -> list[AILessonAttend
                     attend_lesson_infos[0]["lesson"].lesson_id,
                     attend_status_values[ATTEND_STATUS_COMPLETED],
                     ATTEND_STATUS_COMPLETED,
+                    attend_lesson_infos[0]["lesson"].lesson_type,
                 )
             )
         # 找到下一章节进行解锁
@@ -416,6 +475,7 @@ def update_attend_lesson_info(app: Flask, attend_id: str) -> list[AILessonAttend
                             next_lesson_attend["lesson"].lesson_id,
                             attend_status_values[ATTEND_STATUS_NOT_STARTED],
                             ATTEND_STATUS_NOT_STARTED,
+                            next_lesson_attend["lesson"].lesson_type,
                         )
                     )
                 if next_lesson_attend["lesson"].lesson_no == next_no + "01" and (
@@ -432,10 +492,12 @@ def update_attend_lesson_info(app: Flask, attend_id: str) -> list[AILessonAttend
                             next_lesson_attend["lesson"].lesson_id,
                             attend_status_values[ATTEND_STATUS_NOT_STARTED],
                             ATTEND_STATUS_NOT_STARTED,
+                            next_lesson_attend["lesson"].lesson_type,
                         )
                     )
         else:
             app.logger.info("no next lesson")
+    app.logger.info("current res lenth:{}".format(len(res)))
     for i in range(len(attend_lesson_infos)):
         if (
             i > 0
@@ -451,9 +513,9 @@ def update_attend_lesson_info(app: Flask, attend_id: str) -> list[AILessonAttend
                     attend_lesson_infos[i]["lesson"].lesson_id,
                     attend_status_values[ATTEND_STATUS_NOT_STARTED],
                     ATTEND_STATUS_NOT_STARTED,
+                    attend_lesson_infos[i]["lesson"].lesson_type,
                 )
             )
-    app.logger.info("res:{}".format(",".join([r.lesson_no for r in res])))
     return res
 
 

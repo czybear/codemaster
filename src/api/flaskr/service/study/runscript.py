@@ -7,41 +7,42 @@ from flaskr.service.user.models import User
 from flaskr.i18n import _
 from ...api.langfuse import langfuse_client as langfuse
 from ...service.lesson.const import (
-    UI_TYPE_CHECKCODE,
-    UI_TYPE_CONTINUED,
-    UI_TYPE_LOGIN,
-    UI_TYPE_PHONE,
-    UI_TYPE_TO_PAY,
+    LESSON_TYPE_TRIAL,
 )
 from ...service.lesson.models import AICourse, AILesson
 from ...service.order.consts import (
     ATTEND_STATUS_BRANCH,
+    ATTEND_STATUS_COMPLETED,
     ATTEND_STATUS_IN_PROGRESS,
     ATTEND_STATUS_NOT_STARTED,
+    ATTEND_STATUS_RESET,
+    ATTEND_STATUS_LOCKED,
     get_attend_status_values,
-    BUY_STATUS_SUCCESS,
 )
 from ...service.order.funs import (
     AICourseLessonAttendDTO,
     init_trial_lesson,
-    query_raw_buy_record,
+    init_trial_lesson_inner,
 )
 from ...service.order.models import AICourseLessonAttend
 from ...service.study.const import (
     INPUT_TYPE_ASK,
     INPUT_TYPE_START,
+    INPUT_TYPE_CONTINUE,
 )
 from ...service.study.dtos import ScriptDTO
 from ...dao import db, redis_client
 from .utils import (
     make_script_dto,
     get_script,
-    update_attend_lesson_info,
+    update_lesson_status,
     get_current_lesson,
 )
 from .input_funcs import BreakException
 from .output_funcs import handle_output
-from .plugin import handle_input, handle_ui
+from .plugin import handle_input, handle_ui, check_continue
+from .utils import make_script_dto_to_stream
+from flaskr.service.study.dtos import AILessonAttendDTO
 
 
 def run_script_inner(
@@ -52,6 +53,7 @@ def run_script_inner(
     input: str = None,
     input_type: str = None,
     script_id: str = None,
+    log_id: str = None,
 ) -> Generator[str, None, None]:
     with app.app_context():
         script_info = None
@@ -80,17 +82,21 @@ def run_script_inner(
                 lessons = init_trial_lesson(app, user_id, course_id)
                 attend = get_current_lesson(app, lessons)
                 lesson_id = attend.lesson_id
+                lesson_info = AILesson.query.filter(
+                    AILesson.lesson_id == lesson_id,
+                ).first()
+                if not lesson_info:
+                    raise_error("LESSON.LESSON_NOT_FOUND_IN_COURSE")
             else:
                 lesson_info = AILesson.query.filter(
                     AILesson.lesson_id == lesson_id,
-                    AILesson.status == 1,
                 ).first()
                 if not lesson_info:
                     raise_error("LESSON.LESSON_NOT_FOUND_IN_COURSE")
                 course_id = lesson_info.course_id
                 app.logger.info(
-                    "user_id:{},course_id:{},lesson_id:{}".format(
-                        user_id, course_id, lesson_id
+                    "user_id:{},course_id:{},lesson_id:{},lesson_no:{}".format(
+                        user_id, course_id, lesson_id, lesson_info.lesson_no
                     )
                 )
                 if not lesson_info:
@@ -101,83 +107,82 @@ def run_script_inner(
                 ).first()
                 if not course_info:
                     raise_error("LESSON.COURSE_NOT_FOUND")
+                # return the teacher avator
                 yield make_script_dto(
                     "teacher_avator", course_info.course_teacher_avator, ""
                 )
-                parent_no = lesson_info.lesson_no
-                if len(parent_no) >= 2:
-                    parent_no = parent_no[:-2]
-                lessons = AILesson.query.filter(
-                    AILesson.lesson_no.like(parent_no + "__"),
-                    AILesson.status == 1,
-                    AILesson.course_id == course_id,
-                ).all()
-                app.logger.info(
-                    "study lesson no :{}".format(
-                        ",".join([lesson.lesson_no for lesson in lessons])
-                    )
-                )
-                lesson_ids = [lesson.lesson_id for lesson in lessons]
+
                 attend_info = AICourseLessonAttend.query.filter(
                     AICourseLessonAttend.user_id == user_id,
                     AICourseLessonAttend.course_id == course_id,
-                    AICourseLessonAttend.lesson_id.in_(lesson_ids),
-                    AICourseLessonAttend.status.in_(
-                        [
-                            ATTEND_STATUS_NOT_STARTED,
-                            ATTEND_STATUS_IN_PROGRESS,
-                            ATTEND_STATUS_BRANCH,
-                        ]
-                    ),
+                    AICourseLessonAttend.lesson_id == lesson_id,
+                    AICourseLessonAttend.status != ATTEND_STATUS_RESET,
                 ).first()
-
                 if not attend_info:
+                    if lesson_info.lesson_type == LESSON_TYPE_TRIAL:
+                        app.logger.info(
+                            "init trial lesson for user:{} course:{}".format(
+                                user_id, course_id
+                            )
+                        )
+                        new_attend_infos = init_trial_lesson_inner(
+                            app, user_id, course_id
+                        )
+                        new_attend_maps = {i.lesson_id: i for i in new_attend_infos}
+                        attend_info = new_attend_maps.get(lesson_id, None)
+                        if not attend_info:
+                            raise_error("LESSON.LESSON_NOT_FOUND_IN_COURSE")
+                    else:
+                        raise_error("COURSE.COURSE_NOT_PURCHASED")
 
-                    lessons.sort(key=lambda x: x.lesson_no)
-                    lesson_id = lessons[-1].lesson_id
-                    attend_info = AICourseLessonAttend.query.filter(
+                if (
+                    attend_info.status == ATTEND_STATUS_COMPLETED
+                    or attend_info.status == ATTEND_STATUS_LOCKED
+                ):
+
+                    parent_no = lesson_info.lesson_no
+                    if len(parent_no) >= 2:
+                        parent_no = parent_no[:-2]
+                    lessons = AILesson.query.filter(
+                        AILesson.lesson_no.like(parent_no + "__"),
+                        AILesson.course_id == course_id,
+                        AILesson.status == 1,
+                    ).all()
+                    app.logger.info(
+                        "study lesson no :{}".format(
+                            ",".join([lesson.lesson_no for lesson in lessons])
+                        )
+                    )
+                    lesson_ids = [lesson.lesson_id for lesson in lessons]
+                    attend_infos = AICourseLessonAttend.query.filter(
                         AICourseLessonAttend.user_id == user_id,
                         AICourseLessonAttend.course_id == course_id,
-                        AICourseLessonAttend.lesson_id == lesson_id,
-                    ).first()
-
-                    if not attend_info:
-                        app.logger.info("found no attend_info reinit")
-                        lessons = init_trial_lesson(app, user_id, course_id)
-                        attend_info = AICourseLessonAttend.query.filter(
-                            AICourseLessonAttend.user_id == user_id,
-                            AICourseLessonAttend.course_id == course_id,
-                            AICourseLessonAttend.lesson_id.in_(lesson_ids),
-                            AICourseLessonAttend.status.in_(
-                                [
-                                    ATTEND_STATUS_NOT_STARTED,
-                                    ATTEND_STATUS_IN_PROGRESS,
-                                    ATTEND_STATUS_BRANCH,
-                                ]
-                            ),
-                        ).first()
-                        attend_id = attend_info.attend_id
-                    else:
-                        attend_id = attend_info.attend_id
-
-                    attends = update_attend_lesson_info(app, attend_id)
-                    for attend_update in attends:
-                        if len(attend_update.lesson_no) > 2:
-                            yield make_script_dto(
-                                "lesson_update", attend_update.__json__(), ""
-                            )
-                        else:
-                            yield make_script_dto(
-                                "chapter_update", attend_update.__json__(), ""
-                            )
-                            if (
-                                attend_update.status
-                                == attend_status_values[ATTEND_STATUS_NOT_STARTED]
-                            ):
-                                yield make_script_dto(
-                                    "next_chapter", attend_update.__json__(), ""
-                                )
-                lesson_id = attend_info.lesson_id
+                        AICourseLessonAttend.lesson_id.in_(lesson_ids),
+                        AICourseLessonAttend.status.in_(
+                            [
+                                ATTEND_STATUS_NOT_STARTED,
+                                ATTEND_STATUS_IN_PROGRESS,
+                                ATTEND_STATUS_BRANCH,
+                            ]
+                        ),
+                    ).all()
+                    attend_maps = {i.lesson_id: i for i in attend_infos}
+                    lessons = sorted(lessons, key=lambda x: x.lesson_no)
+                    for lesson in lessons:
+                        lesson_attend_info = attend_maps.get(lesson.lesson_id, None)
+                        if (
+                            len(lesson.lesson_no) > 2
+                            and lesson_attend_info
+                            and lesson_attend_info.status
+                            in [
+                                ATTEND_STATUS_NOT_STARTED,
+                                ATTEND_STATUS_IN_PROGRESS,
+                                ATTEND_STATUS_BRANCH,
+                            ]
+                        ):
+                            lesson_id = lesson_attend_info.lesson_id
+                            attend_info = lesson_attend_info
+                            break
                 attend = AICourseLessonAttendDTO(
                     attend_info.attend_id,
                     attend_info.lesson_id,
@@ -187,27 +192,33 @@ def run_script_inner(
                     attend_info.script_index,
                 )
                 db.session.flush()
-            # Langfuse 集成
+            # Langfuse
             trace_args = {}
             trace_args["user_id"] = user_id
             trace_args["session_id"] = attend.attend_id
             trace_args["input"] = input
-            trace_args["name"] = "ai-python"
+            trace_args["name"] = course_info.course_name
             trace = langfuse.trace(**trace_args)
-
             trace_args["output"] = ""
             next = 0
             is_first_add = False
-            # 如果有用户输入,就得到当前这一条,否则得到下一条
+            # get the script info and the attend updates
             script_info, attend_updates, is_first_add = get_script(
                 app, attend_id=attend.attend_id, next=next
             )
+            auto_next_lesson_id = None
+            next_chapter_no = None
             if len(attend_updates) > 0:
+                app.logger.info(f"attend_updates: {attend_updates}")
                 for attend_update in attend_updates:
                     if len(attend_update.lesson_no) > 2:
                         yield make_script_dto(
                             "lesson_update", attend_update.__json__(), ""
                         )
+                        if next_chapter_no and attend_update.lesson_no.startswith(
+                            next_chapter_no
+                        ):
+                            auto_next_lesson_id = attend_update.lesson_id
                     else:
                         yield make_script_dto(
                             "chapter_update", attend_update.__json__(), ""
@@ -219,42 +230,30 @@ def run_script_inner(
                             yield make_script_dto(
                                 "next_chapter", attend_update.__json__(), ""
                             )
+                            next_chapter_no = attend_update.lesson_no
+
             if script_info:
                 try:
-                    check_paid = True
-                    # to do  seperate
-                    if script_info.script_ui_type == UI_TYPE_TO_PAY:
-                        order = query_raw_buy_record(app, user_id, course_id)
-                        if order and order.status == BUY_STATUS_SUCCESS:
-                            # 如果已经购买
-                            check_paid = True
-                        else:
-                            check_paid = False
-
-                    else:
-                        # 处理用户输入
-                        response = handle_input(
-                            app,
-                            user_id,
-                            input_type,
-                            attend,
-                            script_info,
-                            input,
-                            trace,
-                            trace_args,
-                        )
-                        if response:
-                            yield from response
-
-                    # 如果是Start或是Continue，就不需要再次获取脚本
+                    # handle user input
+                    response = handle_input(
+                        app,
+                        user_info,
+                        input_type,
+                        lesson_info,
+                        attend,
+                        script_info,
+                        input,
+                        trace,
+                        trace_args,
+                    )
+                    if response:
+                        yield from response
+                    # check if the script is start or continue
                     if input_type == INPUT_TYPE_START:
                         next = 0
                     else:
-                        next = check_paid and 1 or 0
+                        next = 1
                     while True and input_type != INPUT_TYPE_ASK:
-                        app.logger.info(
-                            "next:{} is_first:{}".format(next, is_first_add)
-                        )
                         if is_first_add:
                             is_first_add = False
                             next = 0
@@ -263,6 +262,7 @@ def run_script_inner(
                         )
                         next = 1
                         if len(attend_updates) > 0:
+                            app.logger.info(f"attend_updates: {attend_updates}")
                             for attend_update in attend_updates:
                                 if len(attend_update.lesson_no) > 2:
                                     yield make_script_dto(
@@ -282,15 +282,10 @@ def run_script_inner(
                                             "next_chapter", attend_update.__json__(), ""
                                         )
                         if script_info:
-                            if (
-                                script_info.script_ui_type
-                                in [UI_TYPE_PHONE, UI_TYPE_CHECKCODE, UI_TYPE_LOGIN]
-                            ) and user_info.user_state != 0:
-                                next = 1
-                                continue
                             response = handle_output(
                                 app,
                                 user_id,
+                                lesson_info,
                                 attend,
                                 script_info,
                                 input,
@@ -300,53 +295,113 @@ def run_script_inner(
                             if response:
                                 yield from response
 
-                            app.logger.info(
-                                "script ui type {}".format(script_info.script_ui_type)
-                            )
-                            if script_info.script_ui_type == UI_TYPE_CONTINUED:
-                                continue
-                            if (
-                                script_info.script_ui_type == UI_TYPE_PHONE
-                                and user_info.user_state != 0
-                            ):
-                                continue
-                            if (
-                                script_info.script_ui_type == UI_TYPE_CHECKCODE
-                                and user_info.user_state != 0
-                            ):
-                                continue
-                            if (
-                                script_info.script_ui_type == UI_TYPE_LOGIN
-                                and user_info.user_state != 0
-                            ):
-                                continue
-
-                            break
-                        else:
-                            break
-                    if script_info:
-                        # 返回下一轮交互
-                        # 返回  下一轮的交互方式
-                        if script_info.script_ui_type == UI_TYPE_CONTINUED:
-                            next = 1
-                            input_type = None
-                        else:
-                            yield from handle_ui(
+                            if check_continue(
                                 app,
-                                user_id,
+                                user_info,
                                 attend,
                                 script_info,
                                 input,
                                 trace,
                                 trace_args,
-                            )
+                            ):
+                                app.logger.info(f"check_continue: {script_info}")
+                                next = 1
+                                input_type = INPUT_TYPE_CONTINUE
+                                continue
+                            else:
+                                break
+                        else:
+                            break
+                    if script_info:
+                        # 返回下一轮交互
+                        # 返回  下一轮的交互方式
+                        script_dtos = handle_ui(
+                            app,
+                            user_info,
+                            attend,
+                            script_info,
+                            input,
+                            trace,
+                            trace_args,
+                        )
+                        for script_dto in script_dtos:
+                            yield make_script_dto_to_stream(script_dto)
                     else:
-                        attends = update_attend_lesson_info(app, attend.attend_id)
-                        for attend_update in attends:
+                        res = update_lesson_status(app, attend.attend_id)
+                        if res:
+                            for attend_update in res:
+                                if isinstance(attend_update, AILessonAttendDTO):
+                                    if len(attend_update.lesson_no) > 2:
+                                        yield make_script_dto(
+                                            "lesson_update",
+                                            attend_update.__json__(),
+                                            "",
+                                        )
+                                        if (
+                                            next_chapter_no
+                                            and attend_update.lesson_no.startswith(
+                                                next_chapter_no
+                                            )
+                                        ):
+                                            auto_next_lesson_id = (
+                                                attend_update.lesson_id
+                                            )
+                                    else:
+                                        yield make_script_dto(
+                                            "chapter_update",
+                                            attend_update.__json__(),
+                                            "",
+                                        )
+                                        if (
+                                            attend_update.status
+                                            == attend_status_values[
+                                                ATTEND_STATUS_NOT_STARTED
+                                            ]
+                                        ):
+                                            yield make_script_dto(
+                                                "next_chapter",
+                                                attend_update.__json__(),
+                                                "",
+                                            )
+                                            next_chapter_no = attend_update.lesson_no
+                                elif isinstance(attend_update, ScriptDTO):
+                                    app.logger.info(
+                                        f"extend_update_lesson_status: {attend_update}"
+                                    )
+                                    yield make_script_dto_to_stream(attend_update)
+                except BreakException:
+                    if script_info:
+                        yield make_script_dto("text_end", "", None)
+                        script_dtos = handle_ui(
+                            app,
+                            user_id,
+                            attend,
+                            script_info,
+                            input,
+                            trace,
+                            trace_args,
+                        )
+                        for script_dto in script_dtos:
+                            yield make_script_dto_to_stream(script_dto)
+                    db.session.commit()
+                    return
+            else:
+                app.logger.info("script_info is None,to update attend")
+                res = update_lesson_status(app, attend.attend_id)
+                if res and len(res) > 0:
+                    for attend_update in res:
+                        if isinstance(attend_update, AILessonAttendDTO):
                             if len(attend_update.lesson_no) > 2:
                                 yield make_script_dto(
                                     "lesson_update", attend_update.__json__(), ""
                                 )
+                                if (
+                                    next_chapter_no
+                                    and attend_update.lesson_no.startswith(
+                                        next_chapter_no
+                                    )
+                                ):
+                                    auto_next_lesson_id = attend_update.lesson_id
                             else:
                                 yield make_script_dto(
                                     "chapter_update", attend_update.__json__(), ""
@@ -358,41 +413,22 @@ def run_script_inner(
                                     yield make_script_dto(
                                         "next_chapter", attend_update.__json__(), ""
                                     )
-                        app.logger.info("script_info is None")
-                except BreakException:
-                    if script_info:
-                        yield make_script_dto("text_end", "", None)
-                        yield from handle_ui(
-                            app,
-                            user_id,
-                            attend,
-                            script_info,
-                            input,
-                            trace,
-                            trace_args,
-                        )
-                    db.session.commit()
-                    return
-            else:
-                app.logger.info("script_info is None,to update attend")
-                attends = update_attend_lesson_info(app, attend.attend_id)
-                for attend_update in attends:
-                    if len(attend_update.lesson_no) > 2:
-                        yield make_script_dto(
-                            "lesson_update", attend_update.__json__(), ""
-                        )
-                    else:
-                        yield make_script_dto(
-                            "chapter_update", attend_update.__json__(), ""
-                        )
-                        if (
-                            attend_update.status
-                            == attend_status_values[ATTEND_STATUS_NOT_STARTED]
-                        ):
-                            yield make_script_dto(
-                                "next_chapter", attend_update.__json__(), ""
+                                    next_chapter_no = attend_update.lesson_no
+                        elif isinstance(attend_update, ScriptDTO):
+                            app.logger.info(
+                                f"extend_update_lesson_status: {attend_update}"
                             )
+                            yield make_script_dto_to_stream(attend_update)
             db.session.commit()
+            if auto_next_lesson_id:
+                app.logger.info("auto_next_lesson_id:{}".format(auto_next_lesson_id))
+                yield from run_script_inner(
+                    app,
+                    user_id,
+                    course_id,
+                    auto_next_lesson_id,
+                    input_type=INPUT_TYPE_START,
+                )
         except GeneratorExit:
             db.session.rollback()
             app.logger.info("GeneratorExit")
@@ -406,6 +442,7 @@ def run_script(
     input: str = None,
     input_type: str = None,
     script_id: str = None,
+    log_id: str = None,
 ) -> Generator[ScriptDTO, None, None]:
     timeout = 5 * 60
     blocking_timeout = 1
@@ -417,7 +454,7 @@ def run_script(
         try:
             app.logger.info("run_script with lock")
             yield from run_script_inner(
-                app, user_id, course_id, lesson_id, input, input_type, script_id
+                app, user_id, course_id, lesson_id, input, input_type, script_id, log_id
             )
             app.logger.info("run_script end")
         except Exception as e:
@@ -430,10 +467,12 @@ def run_script(
                 "description": str(e),
                 "traceback": traceback.format_exc(),
             }
-            app.logger.error(error_info)
+
             if isinstance(e, AppException):
+                app.logger.info(error_info)
                 yield make_script_dto("text", str(e), None)
             else:
+                app.logger.error(error_info)
                 yield make_script_dto("text", _("COMMON.UNKNOWN_ERROR"), None)
             yield make_script_dto("text_end", "", None)
         finally:

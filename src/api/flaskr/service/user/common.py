@@ -7,9 +7,11 @@ import string
 import uuid
 from flaskr.common.config import get_config
 from flask import Flask
+
 import jwt
 
 from flaskr.service.order.consts import ATTEND_STATUS_RESET
+from flaskr.service.user.models import User
 from flaskr.service.profile.funcs import (
     get_user_profile_labels,
     update_user_profile_with_lable,
@@ -27,13 +29,17 @@ from ..common.models import raise_error
 from .utils import generate_token, get_user_language, get_user_openid
 from ...dao import redis_client as redis, db
 from .models import User as CommonUser, AdminUser as AdminUser
+from flaskr.common.log import get_mode
 
 
 FIX_CHECK_CODE = get_config("UNIVERSAL_VERIFICATION_CODE")
 
 
 def get_model(app: Flask):
-    if app.config.get("MODE", "api") == "admin":
+    mode = get_mode()
+    if mode is None:
+        mode = get_config("MODE", "api")
+    if mode == "admin":
         return AdminUser
     else:
         return CommonUser
@@ -97,6 +103,7 @@ def validate_user(app: Flask, token: str) -> UserInfo:
                 user_id = jwt.decode(
                     token, app.config["SECRET_KEY"], algorithms=["HS256"]
                 )["user_id"]
+                app.logger.info("user_id:" + user_id)
 
             app.logger.info("user_id:" + user_id)
             redis_token = redis.get(app.config["REDIS_KEY_PRRFIX_USER"] + user_id)
@@ -267,15 +274,13 @@ def get_sms_code_info(app: Flask, user_id: str, resend: bool):
         return {"expire_in": ttl, "phone": phone}
 
 
-def send_sms_code_without_check(app: Flask, user_id: str, phone: str):
-    User = get_model(app)
-    user = User.query.filter(User.user_id == user_id).first()
-    user.mobile = phone
+def send_sms_code_without_check(app: Flask, user_info: User, phone: str):
+    user_info.mobile = phone
     characters = string.digits
     random_string = "".join(random.choices(characters, k=4))
     # 发送短信验证码
     redis.set(
-        app.config["REDIS_KEY_PRRFIX_PHONE"] + user_id,
+        app.config["REDIS_KEY_PRRFIX_PHONE"] + user_info.user_id,
         phone,
         ex=app.config.get("PHONE_EXPIRE_TIME", 60 * 30),
     )
